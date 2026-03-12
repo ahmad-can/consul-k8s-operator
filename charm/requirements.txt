@@ -1,6 +1,1 @@
 ops ~= 2.17
-lightkube
-lightkube-models
-pydantic
-jsonschema
-cryptography >= 42.0.0

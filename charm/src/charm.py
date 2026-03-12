@@ -18,24 +18,21 @@ not yet supported.
 
 import json
 import logging
-from typing import Union
 
 from charms.consul_k8s.v0.consul_cluster import ConsulServiceProvider
 from charms.observability_libs.v1.kubernetes_service_patch import KubernetesServicePatch
-from charms.tls_certificates_interface.v3.tls_certificates import (
-    AllCertificatesInvalidatedEvent,
+from charms.tls_certificates_interface.v4.tls_certificates import (
     CertificateAvailableEvent,
-    CertificateExpiringEvent,
-    CertificateInvalidatedEvent,
-    TLSCertificatesRequiresV3,
-    generate_csr,
-    generate_private_key,
+    CertificateRequestAttributes,
+    ProviderCertificate,
+    PrivateKey,
+    TLSCertificatesRequiresV4,
 )
 from lightkube import Client
 from lightkube.models.core_v1 import ServicePort
 from lightkube.resources.core_v1 import Pod
 from ops import main
-from ops.charm import CharmBase, RelationCreatedEvent, RelationEvent
+from ops.charm import CharmBase, RelationEvent
 from ops.model import ActiveStatus, BlockedStatus, Port, WaitingStatus
 from ops.pebble import ChangeError, Error, Layer
 
@@ -62,31 +59,29 @@ class ConsulCharm(CharmBase):
         self.framework.observe(self.on.upgrade_charm, self._on_upgrade)
         self.framework.observe(self.consul.on.endpoints_request, self._on_endpoints_request)
 
-        self.certificates = TLSCertificatesRequiresV3(self, "certificates")
-        self.framework.observe(self.on.install, self._on_install)
-        self.framework.observe(
-            self.on.certificates_relation_created, self._on_certificates_relation_created
+        self._certificate_request = CertificateRequestAttributes(
+            common_name=self._service_fqdn,
+            sans_dns={
+                self._service_fqdn,
+                f"{self._service_fqdn}.cluster.local",
+            },
+            organization="consul",
+        )
+        self.certificates = TLSCertificatesRequiresV4(
+            charm=self,
+            relationship_name="certificates",
+            certificate_requests=[self._certificate_request],
         )
         self.framework.observe(
             self.certificates.on.certificate_available, self._on_certificate_available
-        )
-        self.framework.observe(
-            self.certificates.on.certificate_expiring, self._on_certificate_expiring
-        )
-        self.framework.observe(
-            self.certificates.on.certificate_invalidated, self._on_certificate_invalidated
-        )
-        self.framework.observe(
-            self.certificates.on.all_certificates_invalidated,
-            self._on_all_certificates_invalidated,
         )
 
     def get_consul_ports(self) -> Ports:
         """Return consul ports with supported values."""
         ports = {
             "dns": -1,  # Not supported
-            "http": 8500,
-            "https": -1,  # Not supported
+            "http": -1,  # Disable plain HTTP; use HTTPS only
+            "https": 8501,
             "grpc": -1,  # Not supported
             "grpc_tls": -1,  # Not supported
             "serf_lan": 8301,
@@ -119,7 +114,7 @@ class ConsulCharm(CharmBase):
             self.unit.set_ports(
                 Port("tcp", self.ports.serf_lan),
                 Port("udp", self.ports.serf_lan),
-                Port("tcp", self.ports.http),
+                Port("tcp", self.ports.https),
             )
             return
 
@@ -138,10 +133,10 @@ class ConsulCharm(CharmBase):
                 nodePort=self.ports.serf_lan,
             ),
             ServicePort(
-                self.ports.http,
-                name=f"juju-{self.ports.http}-tcp",
+                self.ports.https,
+                name=f"juju-{self.ports.https}-tcp",
                 protocol="TCP",
-                targetPort=self.ports.http,
+                targetPort=self.ports.https,
             ),
         ]
 
@@ -178,9 +173,16 @@ class ConsulCharm(CharmBase):
         if not self.workload.can_connect():
             self._update_status(WaitingStatus("Waiting for Pebble ready"))
             return
+        if not self.model.get_relation("certificates"):
+            self._update_status(BlockedStatus("Integration certificates missing"))
+            return
+        if not self._tls_material_ready():
+            self._update_status(WaitingStatus("Waiting for TLS certificates"))
+            return
 
         consul_config_changed = self._update_consul_config()
         pebble_layer_changed = self._update_pebble_layer()
+        self._write_cli_defaults()
         restart = any([consul_config_changed, pebble_layer_changed])
 
         if restart:
@@ -270,8 +272,8 @@ class ConsulCharm(CharmBase):
         return None
 
     def _get_internal_http_endpoint(self) -> str:
-        # Return ClusterIP dns service name
-        return f"{self.model.app.name}.{self.model.name}.svc:{self.ports.http}"
+        # Return ClusterIP dns service name (HTTPS)
+        return f"{self.model.app.name}.{self.model.name}.svc:{self.ports.https}"
 
     def _get_exernal_http_endpoint(self) -> str | None:
         # Placeholder to send ingress endpoint once ingress relation is implemented
@@ -302,111 +304,19 @@ class ConsulCharm(CharmBase):
             external_http_endpoint,
         )
 
-    def _on_install(self, event) -> None:
-        private_key_password = b"banana"  # What do we want to set this to?
-        private_key = generate_private_key(password=private_key_password)
-        certificates_relation = self.model.get_relation("certificates")
-        if not certificates_relation:
-            self.unit.status = WaitingStatus("Waiting for peer relation to be created")
-            event.defer()
-            return
-        certificates_relation.data[self.app].update(
-            {"private_key_password": "banana", "private_key": private_key.decode()}
-        )
-
-    def _on_certificates_relation_created(self, event: RelationCreatedEvent) -> None:
-        """Handle the creation of the TLS certificates relation."""
-        certificates_relation = self.model.get_relation("certificates")
-        if not certificates_relation:
-            self.unit.status = WaitingStatus("Waiting for peer relation to be created")
-            event.defer()
-            return
-        private_key_password = certificates_relation.data[self.app].get("private_key_password")
-        private_key = certificates_relation.data[self.app].get("private_key")
-        csr = generate_csr(
-            private_key=private_key.encode(),
-            private_key_password=private_key_password.encode(),
-            subject=self.cert_subject,
-        )
-        certificates_relation.data[self.app].update({"csr": csr.decode()})
-        self.certificates.request_certificate_creation(certificate_signing_request=csr)
-
-    def _on_certificate_available(self, event: CertificateAvailableEvent) -> None:
-        certificates_relation = self.model.get_relation("certificates")
-        if not certificates_relation:
-            self.unit.status = WaitingStatus("Waiting for peer relation to be created")
-            event.defer()
+    def _on_certificate_available(self, _: CertificateAvailableEvent) -> None:
+        if not self.workload.can_connect():
             return
 
-        cert_dir = "/consul/config/certs"
-        cert_file = f"{cert_dir}/server-cert.pem"
-        key_file = f"{cert_dir}/server-key.pem"
-        ca_file = f"{cert_dir}/ca.pem"
-
-        private_key = certificates_relation.data[self.app].get("private_key")
-
-        self.workload.push(cert_file, event.certificate, make_dirs=True)
-        self.workload.push(key_file, private_key, make_dirs=True)
-        self.workload.push(ca_file, event.ca, make_dirs=True)
-
-        self.unit.status = ActiveStatus()
-
-    def _on_certificate_expiring(
-        self, event: Union[CertificateExpiringEvent, CertificateInvalidatedEvent]
-    ) -> None:
-        certificates_relation = self.model.get_relation("certificates")
-        if not certificates_relation:
-            self.unit.status = WaitingStatus("Waiting for peer relation to be created")
-            event.defer()
+        provider_certificate, private_key = self.certificates.get_assigned_certificate(
+            self._certificate_request
+        )
+        if not provider_certificate or not private_key:
+            logger.debug("Certificate event fired but certificate not available yet")
             return
-        old_csr = certificates_relation.data[self.app].get("csr")
-        private_key_password = certificates_relation.data[self.app].get("private_key_password")
-        private_key = certificates_relation.data[self.app].get("private_key")
-        new_csr = generate_csr(
-            private_key=private_key.encode(),
-            private_key_password=private_key_password.encode(),
-            subject=self.cert_subject,
-        )
-        self.certificates.request_certificate_renewal(
-            old_certificate_signing_request=old_csr,
-            new_certificate_signing_request=new_csr,
-        )
-        certificates_relation.data[self.app].update({"csr": new_csr.decode()})
 
-    def _certificate_revoked(self) -> None:
-        certificates_relation = self.model.get_relation("certificates")
-        old_csr = certificates_relation.data[self.app].get("csr")
-        private_key_password = certificates_relation.data[self.app].get("private_key_password")
-        private_key = certificates_relation.data[self.app].get("private_key")
-        new_csr = generate_csr(
-            private_key=private_key.encode(),
-            private_key_password=private_key_password.encode(),
-            subject=self.cert_subject,
-        )
-        self.certificates.request_certificate_renewal(
-            old_certificate_signing_request=old_csr,
-            new_certificate_signing_request=new_csr,
-        )
-        certificates_relation.data[self.app].update({"csr": new_csr.decode()})
-        certificates_relation.data[self.app].pop("certificate")
-        certificates_relation.data[self.app].pop("ca")
-        certificates_relation.data[self.app].pop("chain")
-        self.unit.status = WaitingStatus("Waiting for new certificate")
-
-    def _on_certificate_invalidated(self, event: CertificateInvalidatedEvent) -> None:
-        certificates_relation = self.model.get_relation("certificates")
-        if not certificates_relation:
-            self.unit.status = WaitingStatus("Waiting for peer relation to be created")
-            event.defer()
-            return
-        if event.reason == "revoked":
-            self._certificate_revoked()
-        if event.reason == "expired":
-            self._on_certificate_expiring(event)
-
-    def _on_all_certificates_invalidated(self, event: AllCertificatesInvalidatedEvent) -> None:
-        # Do what you want with this information, probably remove all certificates.
-        pass
+        self._write_tls_assets(provider_certificate, private_key)
+        self._configure()
 
     @property
     def _pebble_layer(self) -> Layer:
@@ -444,6 +354,113 @@ class ConsulCharm(CharmBase):
     def workload(self):
         """The main workload of the charm."""
         return self.unit.get_container(self.name)
+
+    def _write_tls_assets(
+        self,
+        provider_certificate: ProviderCertificate,
+        private_key: PrivateKey,
+    ) -> None:
+        """Write certificate, key, and CA chain into the workload container."""
+        cert_dir = "/consul/config/certs"
+        cert_file = f"{cert_dir}/server-cert.pem"
+        key_file = f"{cert_dir}/server-key.pem"
+        ca_file = f"{cert_dir}/ca.pem"
+
+        chain_parts = [str(provider_certificate.ca)]
+        chain_parts.extend(str(cert) for cert in provider_certificate.chain)
+        chain_pem = "\n".join(chain_parts)
+
+        self.workload.push(cert_file, str(provider_certificate.certificate), make_dirs=True)
+        self.workload.push(key_file, str(private_key), make_dirs=True)
+        self.workload.push(ca_file, chain_pem, make_dirs=True)
+        logger.info("Updated Consul TLS assets")
+
+    def _write_cli_defaults(self) -> None:
+        """Write a default .consulrc so CLI works without extra env exports."""
+        if not self.workload.can_connect():
+            return
+
+        address = f"https://{self._service_fqdn}:{self.ports.https}"
+        cli_config = {
+            "address": address,
+            "ca_file": "/consul/config/certs/ca.pem",
+            "cert_file": "/consul/config/certs/server-cert.pem",
+            "key_file": "/consul/config/certs/server-key.pem",
+            "tls_server_name": self._service_fqdn,
+        }
+        try:
+            self.workload.push("/root/.consulrc", json.dumps(cli_config, indent=2), make_dirs=True)
+            logger.info("Wrote default .consulrc for Consul CLI")
+        except Error as e:
+            logger.error(f"Failed to write .consulrc: {e}")
+
+        # Single profile snippet for all shells.
+        profile_snippet = "\n".join(
+            [
+                'export HOME="/root"',
+                f'export CONSUL_HTTP_ADDR="{address}"',
+                'export CONSUL_CACERT="/consul/config/certs/ca.pem"',
+                'export CONSUL_CLIENT_CERT="/consul/config/certs/server-cert.pem"',
+                'export CONSUL_CLIENT_KEY="/consul/config/certs/server-key.pem"',
+                f'export CONSUL_TLS_SERVER_NAME="{self._service_fqdn}"',
+                "",
+            ]
+        )
+        try:
+            self.workload.push(
+                "/etc/profile.d/consul-cli.sh", profile_snippet, make_dirs=True, permissions=0o644
+            )
+            logger.info("Wrote /etc/profile.d/consul-cli.sh for Consul CLI")
+        except Error as e:
+            logger.error(f"Failed to write profile snippet: {e}")
+
+        # Ensure bash shells source the snippet (login and non-login).
+        try:
+            marker = "## Consul CLI defaults (managed by charm)"
+            bashrc = ""
+            try:
+                bashrc = self.workload.pull("/etc/bash.bashrc", encoding="utf-8").read()
+            except FileNotFoundError:
+                bashrc = ""
+            if marker not in bashrc:
+                new_content = "\n".join(
+                    [
+                        bashrc.rstrip(),
+                        marker,
+                        'if [ -f /etc/profile.d/consul-cli.sh ]; then',
+                        "  . /etc/profile.d/consul-cli.sh",
+                        "fi",
+                        "",
+                    ]
+                )
+                self.workload.push("/etc/bash.bashrc", new_content, make_dirs=True, permissions=0o644)
+                logger.info("Updated /etc/bash.bashrc to source consul CLI defaults")
+        except Error as e:
+            logger.error(f"Failed to update /etc/bash.bashrc: {e}")
+
+    @property
+    def _service_fqdn(self) -> str:
+        """Return the in-cluster DNS name for the Consul service."""
+        return f"{self.model.app.name}.{self.model.name}.svc"
+
+    def _tls_material_ready(self) -> bool:
+        """Return True when certificate files are present in the workload."""
+        if not self.workload.can_connect():
+            return False
+
+        cert_dir = "/consul/config/certs"
+        required_files = [
+            f"{cert_dir}/server-cert.pem",
+            f"{cert_dir}/server-key.pem",
+            f"{cert_dir}/ca.pem",
+        ]
+
+        for cert_path in required_files:
+            try:
+                self.workload.pull(cert_path, encoding="utf-8")
+            except (FileNotFoundError, Error):
+                return False
+        return True
 
 
 if __name__ == "__main__":

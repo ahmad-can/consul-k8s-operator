@@ -17,6 +17,10 @@ parts:
   charm:
     charm-binary-python-packages:
       - pydantic
+      - cryptography
+      - lightkube
+      - lightkube-models
+      - jsonschema
     build-packages:
       - libffi-dev
       - libssl-dev

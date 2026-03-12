@@ -13,8 +13,8 @@ class Ports(BaseModel):
     """Ports used in consul."""
 
     dns: int = Field(default=8600)
-    http: int = Field(default=8500)
-    https: int = Field(default=-1)
+    http: int = Field(default=-1)
+    https: int = Field(default=8501)
     grpc: int = Field(default=-1)
     grpc_tls: int = Field(default=-1)
     serf_lan: int = Field(default=8301)
